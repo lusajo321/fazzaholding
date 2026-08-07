@@ -6,3 +6,4 @@ uploads/*
 !uploads/.gitkeep
 .DS_Store
 _fastapi_shim_snippet.html
+backup.sql
