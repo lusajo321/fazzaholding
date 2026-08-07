@@ -1,0 +1,1 @@
+"""FAZZA FastAPI backend."""
