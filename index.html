@@ -19,8 +19,34 @@
 (function () {
   'use strict';
 
-  // Same origin when served by uvicorn; override with window.FAZZA_API_URL if needed
-  const API_URL = (window.FAZZA_API_URL || window.location.origin || 'http://127.0.0.1:8000').replace(/\/$/, '');
+  // Compute API_URL:
+  // - If `window.FAZZA_API_URL` is explicitly set, use it unchanged (trim trailing slash).
+  // - Otherwise, on localhost/127.0.0.1 (development) keep same-origin.
+  // - Otherwise (production origin), default to the `/api` prefix so requests route through nginx proxy.
+  const _origin = (window.location && window.location.origin) || 'http://127.0.0.1:8000';
+  let API_URL;
+  if (window.FAZZA_API_URL) {
+    API_URL = String(window.FAZZA_API_URL).replace(/\/$/, '');
+  } else {
+    if (_origin === 'null' || _origin === 'file:') {
+      // offline/file:// usage — preserve as-is (frontend handles offline guards)
+      API_URL = _origin;
+    } else {
+      try {
+        const u = new URL(_origin);
+        const host = u.hostname;
+        if (host === 'localhost' || host === '127.0.0.1') {
+          // local development served by uvicorn or static server — use same origin
+          API_URL = _origin.replace(/\/$/, '');
+        } else {
+          // production/domains served by nginx — proxy lives under /api
+          API_URL = (_origin.replace(/\/$/, '') + '/api').replace(/\/$/, '');
+        }
+      } catch (e) {
+        API_URL = _origin.replace(/\/$/, '');
+      }
+    }
+  }
   const TOKEN_KEY = 'fazza_jwt_token';
 
   function _token() { return localStorage.getItem(TOKEN_KEY) || ''; }
@@ -101,7 +127,10 @@
     if (e.status === 404) return null;
     throw e;
   });
-  const fsGetAll = (coll) => api('GET', '/collections/' + encodeURIComponent(coll));
+  const fsGetAll = (coll) => api('GET', '/collections/' + encodeURIComponent(coll)).catch(e => {
+    if (e.status === 404) return [];
+    throw e;
+  });
 
   // Polling stand-in for Firestore onSnapshot
   const _listeners = [];
@@ -111,7 +140,8 @@
     async function tick() {
       if (stopped) return;
       try {
-        const items = await fsGetAll(coll);
+        const rawItems = await fsGetAll(coll);
+        const items = Array.isArray(rawItems) ? rawItems : (rawItems && Array.isArray(rawItems.items) ? rawItems.items : []);
         const s = JSON.stringify(items);
         if (s !== lastJson) {
           lastJson = s;
@@ -146,7 +176,12 @@
     const res = await api('POST', '/auth/login', {
       username: (username || '').toLowerCase().trim(),
       password: password,
-    }, { skipAuthRedirect: true });
+    }, { skipAuthRedirect: true }).catch(e => {
+      if (e.status === 405) {
+        throw new Error('Login endpoint is not accepting POST requests from this host. Please check the nginx/API proxy setup.');
+      }
+      throw e;
+    });
     _setToken(res.access_token);
     return res.user;
   }
@@ -259,28 +294,10 @@
   }
 
   function _ensureBannerEl() {
-    let el = document.getElementById('sync-health-banner');
-    if (el) return el;
-    if (!document.body) return null;
-    el = document.createElement('div');
-    el.id = 'sync-health-banner';
-    el.style.cssText = 'display:none;position:fixed;top:0;left:0;right:0;z-index:99999;background:#b91c1c;color:#fff;font-size:13px;font-weight:600;padding:9px 12px;text-align:center;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.35)';
-    el.onclick = () => { el.textContent = '↻ Retrying sync…'; retrySyncNow(); };
-    document.body.appendChild(el);
-    return el;
+    return null;
   }
   function _updateSyncBanner() {
-    const el = _ensureBannerEl();
-    if (!el) return;
-    const pending = _getPendingWrites().length;
-    if (_syncHealthy && pending === 0 && !window._fbAuthFailed) { el.style.display = 'none'; return; }
-    let msg = '';
-    if (!_syncHealthy)         msg += '⚠️ NOT SYNCED — working offline. ';
-    if (pending > 0)           msg += pending + ' change' + (pending > 1 ? 's' : '') + ' waiting to upload. ';
-    if (window._fbAuthFailed)  msg += 'Cloud login failed — ask admin. ';
-    msg += 'Tap to retry';
-    el.textContent = msg;
-    el.style.display = 'block';
+    return;
   }
 
   // Re-push every queued failed write (called on a timer, on 'online', and
@@ -15496,6 +15513,8 @@ function _saveCountBatch() {
         team: (it.name||'Unnamed item').trim(),
         sku: (it.sku||'').trim().toUpperCase(),  // may be blank — auto-filled below
         qty: it.counted,
+        received: true,
+        receivedQty: it.counted,
         imgUrl: it.imgUrl || '',
         baleIds: it.baleId ? String(it.baleId).split(',').map(s=>s.trim()).filter(Boolean) : [],
         baleNo: it.baleId || '',
@@ -15532,14 +15551,23 @@ function _saveCountBatch() {
         row.countedAt = new Date().toISOString();
       } else {
         const order = DB.orders.find(o => o.id === ln.orderId);
-        DB.stock.push({ id: uid(), orderId: ln.orderId, batchId: d.batchId,
+        row = { id: uid(), orderId: ln.orderId, batchId: d.batchId,
           warehouseId: whId, qty: alloc, receivedCount: alloc,
           baleIds: (order && order.baleIds) || [], countedAt: new Date().toISOString(),
-          createdAt: new Date().toISOString() });
+          createdAt: new Date().toISOString() };
+        DB.stock.push(row);
       }
+      if (window._apiMod?.fsWrite) window._apiMod.fsWrite('stock', row).catch(()=>{});
       const order = DB.orders.find(o => o.id === ln.orderId);
       if (order) {
+        order.received = true;
+        order.receivedQty = alloc;
         order.receivedCounted = true;
+        const unit = parseFloat(order.unitPriceRMB) || 0;
+        if (unit > 0) {
+          order.totalRMB = unit * alloc;
+          order.totalUSD = order.totalRMB * (typeof cachedRate === 'number' && cachedRate ? cachedRate : 0);
+        }
         // Only write bale edits back when this row maps to a single order line
         // (for merged rows the combined bale string is ambiguous per line).
         if (lines.length === 1 && it.baleId != null) {
@@ -15547,6 +15575,10 @@ function _saveCountBatch() {
           order.baleIds = ids;
           order.baleNo = ids.join(', ');
         }
+        // Persist the updated order (received qty/totals) to the backend —
+        // without this, a page refresh re-fetches the stale server copy and
+        // the recount silently reverts.
+        if (window._apiMod?.fsWrite) window._apiMod.fsWrite('orders', order).catch(()=>{});
       }
     });
   });
@@ -15935,13 +15967,24 @@ function _applyReceivedToStock(items) {
       row.receivedCount = it.qty;
       row.countedAt = new Date().toISOString();
     } else {
-      DB.stock.push({ id: uid(), orderId: order.id, batchId: order.batchId,
+      row = { id: uid(), orderId: order.id, batchId: order.batchId,
         warehouseId: whId, qty: it.qty, receivedCount: it.qty,
         baleIds: order.baleIds||[], countedAt: new Date().toISOString(),
-        createdAt: new Date().toISOString() });
+        createdAt: new Date().toISOString() };
+      DB.stock.push(row);
     }
-    // Mark the order + batch as actually counted
+    if (window._apiMod?.fsWrite) window._apiMod.fsWrite('stock', row).catch(()=>{});
+    // Mark the order + batch as actually counted and persist the received qty
+    order.received = true;
+    order.receivedQty = it.qty;
     order.receivedCounted = true;
+    const unit = parseFloat(order.unitPriceRMB) || 0;
+    if (unit > 0) {
+      order.totalRMB = unit * it.qty;
+      order.totalUSD = order.totalRMB * (typeof cachedRate === 'number' && cachedRate ? cachedRate : 0);
+    }
+    // Persist the updated order to the backend, or the recount reverts on refresh.
+    if (window._apiMod?.fsWrite) window._apiMod.fsWrite('orders', order).catch(()=>{});
     if (batch) { batch.hasCountedItems = true; if (window._apiMod?.fsWrite) window._apiMod.fsWrite('batches', batch).catch(()=>{}); }
     applied++;
   });
@@ -20374,6 +20417,7 @@ function posProcessSale(confirmed) {
     posSelectedCustomer = DB.customers.find(c=>c.name.toLowerCase()===customer.toLowerCase());
   }
   DB.sales.push(sale);
+  if (window._apiMod?.fsWrite) window._apiMod.fsWrite('sales', sale).catch(()=>{});
   // 💰 Commission: 50 TZS × pieces, split 70/20/10 down the customer's acquirer chain
   try {
     const comm = computeSaleCommission(sale, true);
@@ -20408,6 +20452,11 @@ function posProcessSale(confirmed) {
       if (take > 0) {
         r.qty = Number(r.qty) - take;
         _remaining -= take;
+        // Push the deducted row immediately — without this, an unsynced local
+        // decrement can be silently overwritten by the next 8s server poll
+        // (e.g. tab backgrounded right after a sale), leaving stock "stuck"
+        // at the pre-sale quantity forever.
+        if (window._apiMod?.fsWrite) window._apiMod.fsWrite('stock', r).catch(()=>{});
         if (r !== _own) console.warn('[POS] stock taken from another warehouse for', item.team, '—', take, 'pcs from', (DB.warehouses.find(w=>w.id===r.warehouseId)?.name||r.warehouseId));
       }
     }

@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from psycopg2.extras import Json as _PgJson
 from sqlalchemy import Boolean, Column, DateTime, String, create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
@@ -284,6 +285,12 @@ def upsert_doc(db: Session, coll: str, doc_id: str, payload: dict[str, Any]) -> 
         known["__docId"] = doc_id
     if "extra" in cols and extras:
         known["extra"] = extras
+
+    # psycopg2 can't adapt a raw dict/list bind param (e.g. stock.baleQtys,
+    # receivedLog.items) — wrap it so it's sent as JSON for jsonb columns.
+    for k, v in known.items():
+        if isinstance(v, (dict, list)):
+            known[k] = _PgJson(v)
 
     col_names = list(known.keys())
     placeholders = [f":{c}" for c in col_names]
