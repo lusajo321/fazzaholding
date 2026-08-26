@@ -15728,7 +15728,7 @@ function _renderReceivedCard(entry) {
       </div>`;
 }
 
-// Export a received entry as a PDF to send the supplier
+// Export a received entry as a PDF to send the supplier of the cargo
 function downloadReceivedPDF(id) {
   const entry = (DB.receivedLog||[]).find(e => e.id === id);
   if (!entry) return;
