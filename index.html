@@ -8,13 +8,13 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="theme-color" content="#111614">
 <title>FAZZA — Supplier Portal</title>
-<meta name="version" content="20260805-SAVEFIX1">
+<meta name="version" content="20260829-TRDEDUP2">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>👕</text></svg>">
   <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 
-<!-- FastAPI + PostgreSQL backend (replaces Firebase) -->
+<!-- Firebase SDK -->
 <script>
 (function () {
   'use strict';
@@ -294,11 +294,32 @@
   }
 
   function _ensureBannerEl() {
-    return null;
+    let el = document.getElementById('sync-health-banner');
+    if (el) return el;
+    if (!document.body) return null;
+    el = document.createElement('div');
+    el.id = 'sync-health-banner';
+    el.style.cssText = 'display:none;position:fixed;top:0;left:0;right:0;z-index:99999;background:#b91c1c;color:#fff;font-size:13px;font-weight:600;padding:9px 12px;text-align:center;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.35)';
+    el.onclick = () => { el.textContent = '↻ Retrying sync…'; retrySyncNow(); };
+    document.body.appendChild(el);
+    return el;
   }
   function _updateSyncBanner() {
-    return;
+    const el = _ensureBannerEl();
+    if (!el) return;
+    const pending = _getPendingWrites().length;
+    if (_syncHealthy && pending === 0 && !window._fbAuthFailed) { el.style.display = 'none'; return; }
+    let msg = '';
+    if (!_syncHealthy)         msg += '⚠️ NOT SYNCED — working offline. ';
+    if (pending > 0)           msg += pending + ' change' + (pending > 1 ? 's' : '') + ' waiting to upload. ';
+    if (window._fbAuthFailed)  msg += 'Cloud login failed — ask admin. ';
+    msg += 'Tap to retry';
+    el.textContent = msg;
+    el.style.display = 'block';
   }
+  // NOTE: banner implementation kept from the in-progress Firebase branch —
+  // it's transport-agnostic (reads the same pending-write queue) and is a
+  // real improvement over the old no-op stub.
 
   // Re-push every queued failed write (called on a timer, on 'online', and
   // after every successful sync-down).
@@ -625,9 +646,10 @@
 
   function scheduleFirestorePush() {
     clearTimeout(_pushTimer);
-    _pushTimer = setTimeout(_diffAndPush, 600);
+    _pushTimer = setTimeout(_diffAndPush, 2500);   // coalesce rapid edits into fewer writes
   }
 
+  try { if (typeof _saveFlush === 'function') _saveFlush(); } catch(e){}
   // Flush any pending push IMMEDIATELY (called before logout / page unload so
   // no change is ever lost in the 600ms debounce window).
   function flushFirestorePush() {
@@ -777,6 +799,7 @@
   // ── REAL-TIME listeners — instant updates from any device ───────────────
   function startListening() {
     if (!_getFS()) return;
+    if (_syncActive && _fsListeners.length) return;   // already listening — don't double up (doubles reads)
     _fsListeners.forEach(u => u());
     _fsListeners = [];
 
@@ -804,6 +827,19 @@
           const items2 = items.map(sv => {
             const loc = _localMap[sv.id];
             if (!loc) return sv;
+            // ── LINK PROTECTION (payments & orders) ──
+            // A link (batchId) must never be lost to an UNLINKED incoming copy.
+            // If we're linked and the server copy isn't, keep ours and re-assert.
+            if ((coll === 'payments' || coll === 'orders')) {
+              const locLinked = !!loc.batchId;
+              const svLinked  = !!sv.batchId;
+              if (locLinked && !svLinked) {
+                try { _fsWrite(coll, loc); } catch(e){}   // re-assert our link
+                return loc;
+              }
+              // If both linked but to DIFFERENT batches, higher version wins (a
+              // genuine re-link); fall through to normal resolution below.
+            }
             // Conflict resolution, clock-INDEPENDENT:
             //  1) higher _wV (monotonic version) wins
             //  2) if versions equal/absent, newer _wAt wins
@@ -831,6 +867,10 @@
           // Update in-memory DB FIRST so the UI always reflects the latest data,
           // even if localStorage caching fails due to quota.
           if (window.DB) window.DB[coll] = merged;
+          // Stock self-heal: collapse any duplicate order+warehouse rows right
+          // after a stock sync so counts can't drift and stay drifted.
+          if (coll === 'stock') { try { if (typeof dedupeStockRows === 'function' && dedupeStockRows()) { if (typeof scheduleCloudSync==='function') scheduleCloudSync(); } } catch(e){} }
+          if (coll === 'payments') { try { if (typeof _assertLinkedPayments === 'function') _assertLinkedPayments(); } catch(e){} }
           try {
             // PRESERVE IMAGES: Firestore copies have base64 images stripped (1MB doc
             // limit, Storage disabled). Never let an image-less server copy erase an
@@ -3916,42 +3956,33 @@ function escapeHtml(unsafe) {
 }
 // Short alias
 function _h(s) { return escapeHtml(s); }
-
-function _parseLocalJSON(key, fallback = '[]') {
-  const raw = localStorage.getItem(key);
-  if (!raw || raw.startsWith('ENC:')) return JSON.parse(fallback);
-  try {
-    return JSON.parse(raw);
-  } catch (err) {
-    return JSON.parse(fallback);
-  }
-}
+// ───────────────────────────────────────────────────────────────
 
 // ─────────────────── STATE ───────────────────
 let DB; window.DB = DB = {
-  payments:   _parseLocalJSON('fazza_payments'),
-  batches:    _parseLocalJSON('fazza_batches'),
-  bales:      _parseLocalJSON('fazza_bales'),
-  orders:     _parseLocalJSON('fazza_orders'),
-  sales:      _parseLocalJSON('fazza_sales'),
-  customers:  _parseLocalJSON('fazza_customers'),
-  salesTeam:  _parseLocalJSON('fazza_salesTeam'),
-  commissions:_parseLocalJSON('fazza_commissions'),
-  commissionPayouts: _parseLocalJSON('fazza_commissionPayouts'),
-  expenses:   _parseLocalJSON('fazza_expenses'),
-  warehouses: _parseLocalJSON('fazza_warehouses'),
-  stock:      _parseLocalJSON('fazza_stock'),
-  transfers:  _parseLocalJSON('fazza_transfers'),
-  credits:        _parseLocalJSON('fazza_credits'),
-  creditPayments: _parseLocalJSON('fazza_creditPayments'),
-  cargo:          _parseLocalJSON('fazza_cargo'),
-  cargoPayments:  _parseLocalJSON('fazza_cargoPayments'),
-  cashLogs:       _parseLocalJSON('fazza_cashLogs'),
-  bankDeposits:   _parseLocalJSON('fazza_bankDeposits'),
-  bankWithdrawals:_parseLocalJSON('fazza_bankWithdrawals'),
-  jerseyLibrary:  _parseLocalJSON('fazza_jerseyLibrary'),
-  receivedLog:    _parseLocalJSON('fazza_receivedLog'),
-  settings:       _parseLocalJSON('fazza_settings','{"id":"app_settings"}'),
+  payments:   JSON.parse(localStorage.getItem('fazza_payments')   || '[]'),
+  batches:    JSON.parse(localStorage.getItem('fazza_batches')    || '[]'),
+  bales:      JSON.parse(localStorage.getItem('fazza_bales')      || '[]'),
+  orders:     JSON.parse(localStorage.getItem('fazza_orders')     || '[]'),
+  sales:      JSON.parse(localStorage.getItem('fazza_sales')      || '[]'),
+  customers:  JSON.parse(localStorage.getItem('fazza_customers')  || '[]'),
+  salesTeam:  JSON.parse(localStorage.getItem('fazza_salesTeam')  || '[]'),
+  commissions:JSON.parse(localStorage.getItem('fazza_commissions')|| '[]'),
+  commissionPayouts: JSON.parse(localStorage.getItem('fazza_commissionPayouts') || '[]'),
+  expenses:   JSON.parse(localStorage.getItem('fazza_expenses')   || '[]'),
+  warehouses: JSON.parse(localStorage.getItem('fazza_warehouses') || '[]'),
+  stock:      JSON.parse(localStorage.getItem('fazza_stock')      || '[]'),
+  transfers:  JSON.parse(localStorage.getItem('fazza_transfers')  || '[]'),
+  credits:        JSON.parse(localStorage.getItem('fazza_credits')        || '[]'),
+  creditPayments: JSON.parse(localStorage.getItem('fazza_creditPayments') || '[]'),
+  cargo:          JSON.parse(localStorage.getItem('fazza_cargo') || '[]'),
+  cargoPayments:  JSON.parse(localStorage.getItem('fazza_cargoPayments') || '[]'),
+  cashLogs:       JSON.parse(localStorage.getItem('fazza_cashLogs') || '[]'),
+  bankDeposits:   JSON.parse(localStorage.getItem('fazza_bankDeposits') || '[]'),
+  bankWithdrawals: JSON.parse(localStorage.getItem('fazza_bankWithdrawals') || '[]'),
+  jerseyLibrary:  JSON.parse(localStorage.getItem('fazza_jerseyLibrary') || '[]'),
+  receivedLog:    JSON.parse(localStorage.getItem('fazza_receivedLog') || '[]'),
+  settings:       JSON.parse(localStorage.getItem('fazza_settings') || '{"id":"app_settings"}'),
 };
 // Seed default warehouse if none exist
 if (!DB.warehouses.length) {
@@ -5990,7 +6021,7 @@ function __(key) {
     return (L[currentLang] && L[currentLang][key]) || L.en[key] || key;
   } catch(e) { return key; }
 }
-// Alias  made 
+// Alias
 function t(key) { return __(key); }
 
 // Apply translations to every piece of static HTML + update dynamic renders
@@ -7130,7 +7161,19 @@ window.localStorageReport = function() {
   } catch(e) {}
   return rows;
 };
+let _saveTimer = null;
+let _savePending = false;
 function save() {
+  // Push to cloud immediately (internally debounced) but debounce the heavy
+  // localStorage serialization so many rapid save() calls become ONE disk write.
+  scheduleCloudSync();
+  _savePending = true;
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(_saveToLocalNow, 400);
+}
+function _saveFlush() { if (_savePending) { clearTimeout(_saveTimer); _saveToLocalNow(); } }
+function _saveToLocalNow() {
+  _savePending = false;
   // Capture pre-save state for audit log
   let _auditBefore = null;
   try { _auditBefore = _auditDiffBeforeSave(); } catch(e) { console.warn('Audit pre-save:', e); }
@@ -7206,8 +7249,6 @@ function save() {
       toast('Save error: ' + e.message, 'error');
     }
   }
-  // Then sync to Firebase cloud (debounced)
-  scheduleCloudSync();
 }
 
 // Legacy Firebase cloud loader — replaced by Postgres API sync.
@@ -8318,6 +8359,100 @@ function setRole(r) {
 // ─────────────────── UTILS ───────────────────
 function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2); }
 
+// Deterministic stock-row id: same order+warehouse ALWAYS yields the same id,
+// so concurrent updates from different devices converge instead of duplicating.
+function stockId(orderId, warehouseId) {
+  return 'stk_' + String(orderId||'') + '_' + String(warehouseId||'');
+}
+
+
+// Collapse duplicate stock rows (same order+warehouse) into ONE deterministic
+// row. Idempotent — safe to call anytime. Returns true if it changed anything.
+let _selfHealRunning = false;
+let _selfHealScheduled = false;
+
+// Schedule a debounced self-heal (called after sales/transfers/receives).
+function scheduleStockSelfHeal(delayMs) {
+  if (_selfHealScheduled) return;
+  _selfHealScheduled = true;
+  setTimeout(() => { _selfHealScheduled = false; stockSelfHeal(); }, delayMs || 4000);
+}
+
+// The quiet auto-doctor. Read-mostly: only writes rows that are actually wrong.
+async function stockSelfHeal(opts) {
+  if (_selfHealRunning) return;
+  if (!window.DB || !DB.orders) return;
+  _selfHealRunning = true;
+  try {
+    // 1) collapse any duplicate stock rows (cheap, in-memory)
+    let touched = false;
+    try { if (typeof dedupeStockRows === 'function' && dedupeStockRows()) touched = true; } catch(e){}
+
+    // 2) find received orders whose recorded stock != received−sold±transfers
+    const pushList = [];
+    const receivedBatchIds = new Set((DB.batches||[]).filter(b=>b.status==='Received').map(b=>b.id));
+    let rebuilt = 0;
+    (DB.orders||[]).forEach(o => {
+      if (!receivedBatchIds.has(o.batchId)) return;   // only reconcile received goods
+      const recv = (typeof effRcvQty==='function'?effRcvQty(o):Number(o.qty)||0);
+      const sold = (typeof orderSoldPcs==='function'?orderSoldPcs(o.id):0);
+      const shouldBe = Math.max(0, recv - sold);
+      const stockNow = (DB.stock||[]).filter(s=>s.orderId===o.id).reduce((x,s)=>x+Number(s.qty||0),0);
+      if (stockNow !== shouldBe) {
+        // this order's total is off — rebuild it from the ledger
+        if (typeof rebuildOrderStock === 'function' && rebuildOrderStock(o, pushList)) { rebuilt++; touched = true; }
+      }
+    });
+
+    if (touched) {
+      save();
+      // push corrected rows in ONE throttled batch (never a write storm)
+      if (pushList.length && window.__firebase?.fsBatchWrite) {
+        try { await window.__firebase.fsBatchWrite(pushList.map(s=>({op:'set',coll:'stock',id:s.id,data:s}))); } catch(e){}
+      }
+      if (rebuilt > 0) console.log('%c[self-heal] quietly corrected '+rebuilt+' product(s)','color:#16653a');
+      // refresh stock view if it's open
+      if (document.querySelector('#page-stock.active') && typeof renderStock==='function') { try{ renderStock(); }catch(e){} }
+    }
+  } catch(e) { console.warn('[self-heal] skipped:', e.message); }
+  finally { _selfHealRunning = false; }
+}
+
+// Gentle periodic check (every 3 min) — catches drift from other devices' syncs.
+setInterval(() => { try { stockSelfHeal(); } catch(e){} }, 180000);
+// Also run ~15s after load once things have synced in.
+setTimeout(() => { try { stockSelfHeal(); } catch(e){} }, 15000);
+
+function dedupeStockRows() {
+  const stock = DB.stock || [];
+  const byKey = {};
+  let changed = false;
+  stock.forEach(s => {
+    if (!s || !s.orderId) return;
+    const key = String(s.orderId) + '|' + String(s.warehouseId||'');
+    if (!byKey[key]) byKey[key] = [];
+    byKey[key].push(s);
+  });
+  const kept = [];
+  Object.values(byKey).forEach(rows => {
+    if (rows.length === 1) { kept.push(rows[0]); return; }
+    // Merge duplicates: keep the deterministic-id row (or first), sum quantities.
+    changed = true;
+    const detId = stockId(rows[0].orderId, rows[0].warehouseId);
+    const primary = rows.find(r => r.id === detId) || rows[0];
+    // Use the MAX qty rather than sum — duplicates usually mirror the same real
+    // count; summing would inflate. Max is the safest reconciliation here.
+    primary.qty = Math.max(...rows.map(r => Number(r.qty||0)));
+    primary.id  = detId;
+    primary._wAt = new Date().toISOString();
+    kept.push(primary);
+    // tombstone the extra duplicate ids on the server so they don't come back
+    rows.forEach(r => { if (r.id !== detId && window._apiMod?.markDeleted) { try { window._apiMod.markDeleted('stock', r.id); } catch(e){} } });
+  });
+  if (changed) { DB.stock = kept; }
+  return changed;
+}
+
 // ═══════════════════════ SALES COMMISSION SYSTEM ═══════════════════════
 // Config: rate per piece + split percentages. Editable via Sales Team page.
 function commissionConfig() {
@@ -8411,7 +8546,13 @@ function _isTouchDevice() {
 // drives payment/stock/displays: received if reconciled, else the ordered qty.
 // ═══════════════════════════════════════════════════════════════════════════
 function _effQty(o) {
-  return (o && o.received && o.receivedQty != null) ? Number(o.receivedQty) : Number(o?.qty || 0);
+  // Received/counted quantity ALWAYS wins when present — that's what physically
+  // arrived, and it must drive stock and POS. Only fall back to ordered qty when
+  // the order has genuinely never been counted (receivedQty is null/undefined).
+  if (o && o.receivedQty != null && o.receivedQty !== '' && !isNaN(Number(o.receivedQty))) {
+    return Number(o.receivedQty);
+  }
+  return Number(o?.qty || 0);
 }
 // effRcvQty was referenced ~10 places but NEVER defined — every call silently
 // fell back to ordered qty. Define it as the real received-or-ordered value.
@@ -10021,6 +10162,9 @@ async function savePayment() {
   const channel = document.getElementById('pay-channel').value;
   const batchId = document.getElementById('pay-batch-link').value;
   if (!date || !amount) { toast(__('err-date-amount'), 'error'); return; }
+  if (window._paymentInFlight) { toast('Payment is already saving…','error'); return; }
+  window._paymentInFlight = true;
+  setTimeout(() => { window._paymentInFlight = false; }, 8000);
 
   // Upload receipts to Firebase Storage — NEVER store raw base64 (it overflows
   // localStorage AND freezes the viewer when opened).
@@ -10112,9 +10256,11 @@ async function savePayment() {
     payment.editedBy = _eu?.name || '';
     payment.editedAt = new Date().toISOString();
     DB.payments[idx] = payment;
+    window._paymentInFlight = false;
     toast(__('toast-updated'));
   } else {
     DB.payments.push(payment);
+    window._paymentInFlight = false;
     // 🔔 Notify of supplier payment
     try {
       const _b = DB.batches.find(b=>b.id===batchId);
@@ -10195,6 +10341,10 @@ function deletePayment(id) {
   if (!confirm(__('delete-confirm-pay'))) return;
   const p = DB.payments.find(x=>x.id===id);
   if (!p) { toast('Payment not found','error'); return; }
+  // Tombstone so the deletion sticks and doesn't get restored on refresh.
+  if (window._apiMod?.markDeleted) window._apiMod.markDeleted('payments', id);
+  // also drop from the link watchdog so it isn't re-asserted
+  try { if (window._linkedPaymentGuard) { delete window._linkedPaymentGuard[id]; localStorage.setItem('fazza_linked_pay_guard', JSON.stringify(window._linkedPaymentGuard)); } } catch(e){}
 
   DB.payments = DB.payments.filter(x=>x.id!==id);
 
@@ -10256,6 +10406,39 @@ function _renderFinanceTabs(active) {
 // payments the cloud never received (stranded by old silent write failures)
 // and pulls any cloud payments this device is missing.
 // Assign an orphaned payment to a chosen batch, then re-render Reports.
+// Watchdog: payments the user explicitly linked. If any come back unlinked from
+// a sync, we know a stale device wiped it — we re-assert the link and log who.
+window._linkedPaymentGuard = window._linkedPaymentGuard || {};
+
+function _assertLinkedPayments() {
+  const guard = window._linkedPaymentGuard || {};
+  let fixed = 0;
+  Object.keys(guard).forEach(payId => {
+    const wantBatch = guard[payId];
+    const p = (DB.payments||[]).find(x => x.id === payId);
+    if (!p) return;
+    const batchStillExists = (DB.batches||[]).some(b => b.id === wantBatch);
+    if (!batchStillExists) return;   // don't re-link to a truly deleted batch
+    if (p.batchId !== wantBatch) {
+      console.warn('%c[LINK WATCHDOG] payment ' + payId + ' was UNLINKED by ' +
+        (p._wDev||'?') + ' (v-unknown) — RE-ASSERTING link to ' + wantBatch,
+        'color:#c0392b;font-weight:bold');
+      p.batchId = wantBatch;
+      p._wV = (Number(p._wV)||0) + 1;
+      p._wAt = new Date().toISOString();
+      if (window._apiMod?.fsWrite) window._apiMod.fsWrite('payments', p);
+      fixed++;
+    }
+  });
+  if (fixed && typeof renderReports === 'function') { try { renderReports(); } catch(e){} }
+  return fixed;
+}
+// Persist the guard across refreshes so the link is defended even after reload.
+try {
+  const saved = JSON.parse(localStorage.getItem('fazza_linked_pay_guard')||'{}');
+  window._linkedPaymentGuard = saved;
+} catch(e) {}
+
 async function linkOrphanPayment(payId) {
   const sel = document.getElementById('orphan-link-' + payId);
   const batchId = sel?.value;
@@ -10267,6 +10450,10 @@ async function linkOrphanPayment(payId) {
   p.batchId = batchId;
   p._wAt = new Date().toISOString();
   p._wV  = (Number(p._wV)||0) + 1;    // bump version so a stale device can't revert this link
+  // Register in the persistent watchdog so this link is re-asserted on every
+  // sync/refresh even if a stale device tries to wipe it.
+  window._linkedPaymentGuard[payId] = batchId;
+  try { localStorage.setItem('fazza_linked_pay_guard', JSON.stringify(window._linkedPaymentGuard)); } catch(e){}
   save();
   let ok = true;
   if (window._apiMod?.fsWrite) { try { ok = await window._apiMod.fsWrite('payments', p); } catch(e){ ok = false; } }
@@ -10358,6 +10545,137 @@ window.rescueOrphans = async function(target) {
   console.log('Done. Refresh the Batches page to see the recovered batch.');
 };
 
+// Inspect team names in a batch — diagnoses "team names disappeared" (usually
+// the team field held a number from import, not lost by merge). READ ONLY.
+// Set team names on orders by SKU. Usage:
+//   setTeamNames({ '100-1000-PSH-0258':'Man U Red', '150-1500-PSH-0243':'Chelsea Home', ... })
+window.setTeamNames = function(skuToName) {
+  if (!skuToName || typeof skuToName !== 'object') { console.log('Pass a map like { \'SKU\':\'Team Name\' }'); return; }
+  let n = 0;
+  Object.entries(skuToName).forEach(([sku, name]) => {
+    const orders = (DB.orders||[]).filter(o => String(o.sku||'').toUpperCase() === String(sku).toUpperCase());
+    orders.forEach(o => {
+      o.team = name;
+      o.desc = o.desc || name;
+      o._wAt = new Date().toISOString();
+      o._wV  = (Number(o._wV)||0) + 1;
+      if (window._apiMod?.fsWrite) window._apiMod.fsWrite('orders', o);
+      n++;
+      console.log('%c✓ '+sku+' → '+name, 'color:#16653a');
+    });
+    if (!orders.length) console.warn('no order with SKU '+sku);
+  });
+  save();
+  if (typeof renderBatches === 'function') try { renderBatches(); } catch(e){}
+  console.log('%cUpdated '+n+' order(s). Refresh the batch to see the names.','font-weight:bold;color:#16653a');
+  return n;
+};
+
+// Full number audit for a batch — shows ordered vs received vs stock for every
+// order so ordered↔received gaps are visible. READ ONLY.
+// Sync each order's receivedQty to the REAL received-log quantity, so stock &
+// POS use what was physically counted (not a stale ordered/received value).
+// Usage: syncReceivedFromLog('KAS')  — preview first with auditBatch.
+window.syncReceivedFromLog = function(batchQuery, apply) {
+  const batches = (DB.batches||[]).filter(b =>
+    !batchQuery || String(b.batchId||'').toLowerCase().includes(String(batchQuery).toLowerCase()) || b.id === batchQuery);
+  if (!batches.length) { console.log('No batch matches.'); return; }
+  const changes = [];
+  batches.forEach(b => {
+    // gather received-log items for this batch
+    const logItems = [];
+    (DB.receivedLog||[]).forEach(e => {
+      if (e.batchId !== b.id) return;
+      (e.items||[]).forEach(it => logItems.push(it));
+    });
+    (DB.orders||[]).filter(o=>o.batchId===b.id).forEach(o => {
+      // find the matching log item by orderId or SKU
+      const li = logItems.find(it => it.orderId===o.id)
+              || logItems.find(it => String(it.sku||'').toUpperCase()===String(o.sku||'').toUpperCase());
+      if (!li) return;
+      const realRecv = Number(li.qty||0);
+      const cur = (o.receivedQty!=null?Number(o.receivedQty):Number(o.qty||0));
+      if (realRecv > 0 && realRecv !== cur) {
+        changes.push({ sku:o.sku, team:o.team, was:cur, willBe:realRecv, o });
+      }
+    });
+  });
+  if (!changes.length) { console.log('%c✓ All orders already match the received log','color:#16653a'); return; }
+  console.log('%c'+changes.length+' order(s) whose receivedQty differs from the received log:','font-weight:bold;color:#b45309');
+  console.table(changes.map(c=>({sku:c.sku, team:c.team, currentReceivedQty:c.was, realReceived:c.willBe, diff:c.willBe-c.was})));
+  if (!apply) { console.log('%cThis was a PREVIEW. To apply, run: syncReceivedFromLog(\''+ (batchQuery||'') +'\', true)','color:#3b5bdb'); return changes; }
+  // apply
+  const ops=[];
+  changes.forEach(ch => {
+    const o = ch.o;
+    o.receivedQty = ch.willBe;
+    o.received = true;
+    const unit = parseFloat(o.unitPriceRMB)||0;
+    if (unit>0) { o.totalRMB = unit*ch.willBe; o.totalUSD = o.totalRMB*(typeof cachedRate==='number'?cachedRate:0); }
+    o._wAt = new Date().toISOString(); o._wV=(Number(o._wV)||0)+1;
+    if (window._apiMod?.fsWrite) window._apiMod.fsWrite('orders', o);
+    // rebuild this order's stock from the corrected received qty
+    if (typeof rebuildOrderStock==='function') rebuildOrderStock(o, ops);
+  });
+  save();
+  if (window.__firebase?.fsBatchWrite && ops.length) { window.__firebase.fsBatchWrite(ops.map(s=>({op:'set',coll:'stock',id:s.id,data:s}))).catch(()=>{}); }
+  if (typeof renderReceived==='function') try{renderReceived()}catch(e){}
+  console.log('%c✓ Updated '+changes.length+' order(s) to real received qty + rebuilt their stock','color:#16653a;font-weight:bold');
+  return changes.length;
+};
+
+window.auditBatch = function(batchQuery) {
+  const batches = (DB.batches||[]).filter(b =>
+    !batchQuery || String(b.batchId||'').toLowerCase().includes(String(batchQuery).toLowerCase()) || b.id === batchQuery);
+  if (!batches.length) { console.log('No batch matches. All:'); console.table((DB.batches||[]).map(b=>({batchId:b.batchId,id:b.id}))); return; }
+  batches.forEach(b => {
+    const os = (DB.orders||[]).filter(o=>o.batchId===b.id);
+    console.log('%c═══ '+b.batchId+' — '+os.length+' orders ═══','font-weight:bold;color:#16653a');
+    let totOrd=0, totRcv=0, totStock=0;
+    const rows = os.map(o => {
+      const ordered = Number(o.qty||0);
+      const received = (o.receivedQty!=null && o.receivedQty!=='') ? Number(o.receivedQty) : null;
+      const eff = (typeof effRcvQty==='function'?effRcvQty(o):ordered);
+      const sold = (typeof orderSoldPcs==='function'?orderSoldPcs(o.id):0);
+      const stockNow = (DB.stock||[]).filter(s=>s.orderId===o.id).reduce((x,s)=>x+Number(s.qty||0),0);
+      totOrd+=ordered; totRcv+=(received!=null?received:ordered); totStock+=stockNow;
+      return {
+        sku:o.sku||'', team:o.team||'',
+        ordered,
+        receivedQty: received!=null?received:'(none)',
+        received_flag: o.received?'yes':'NO ⚠️',
+        effUsed: eff,
+        sold, stockNow,
+        ordVsRcv: (received!=null && received!==ordered) ? (received-ordered) : '=',
+      };
+    });
+    console.table(rows);
+    console.log('%cTOTALS — ordered:'+totOrd+' | received:'+totRcv+' | stockNow:'+totStock, 'font-weight:bold;color:#3b5bdb');
+  });
+  return batches;
+};
+
+window.checkTeamNames = function(batchQuery) {
+  const batches = (DB.batches||[]).filter(b =>
+    !batchQuery || String(b.batchId||'').toLowerCase().includes(String(batchQuery).toLowerCase()) || b.id === batchQuery);
+  if (!batches.length) { console.log('No batch matches. All batches:'); console.table((DB.batches||[]).map(b=>({batchId:b.batchId,id:b.id,orders:(DB.orders||[]).filter(o=>o.batchId===b.id).length}))); return; }
+  batches.forEach(b => {
+    const os = (DB.orders||[]).filter(o=>o.batchId===b.id);
+    console.log('%c═══ '+b.batchId+' — '+os.length+' orders ═══','font-weight:bold;color:#16653a');
+    console.table(os.map(o=>({
+      sku:o.sku||'',
+      team:o.team||'(blank)',
+      teamIsNumber: /^\d+$/.test(String(o.team||'').trim()) ? 'YES ⚠️' : '',
+      desc:o.desc||'',
+      name:o.name||'',
+      styleEN:o.styleEN||'', styleCN:o.styleCN||'',
+      qty:o.qty
+    })));
+  });
+  console.log('If team shows a NUMBER, the real name may be in desc/name/styleEN. Tell me and I can map them.');
+  return batches;
+};
+
 window.findOrders = function(batchQuery) {
   const batches = (DB.batches||[]).filter(b =>
     !batchQuery || String(b.batchId||'').toLowerCase().includes(String(batchQuery).toLowerCase()) || b.id === batchQuery);
@@ -10374,6 +10692,64 @@ window.findOrders = function(batchQuery) {
     console.table(orphanOrders.map(o=>({sku:o.sku, team:o.team, qty:o.qty, batchId:o.batchId}))); }
   console.log('Total orders in DB:', (DB.orders||[]).length);
   return batches;
+};
+
+// Trace ALL currently-orphaned payments directly (no need to know the amount).
+window.traceOrphans = function() {
+  const batchIds = new Set((DB.batches||[]).map(b=>b.id));
+  const orphans = (DB.payments||[]).filter(p => !p.batchId || !batchIds.has(p.batchId));
+  if (!orphans.length) { console.log('%c✓ No orphaned payments right now','color:#16653a;font-weight:bold'); return; }
+  console.log('%c'+orphans.length+' orphaned payment(s):','font-weight:bold;color:#b45309');
+  orphans.forEach(p => {
+    const b = (DB.batches||[]).find(x=>x.id===p.batchId);
+    console.log('%c─── Payment '+p.id+' ───','font-weight:bold;color:#3b5bdb');
+    console.table({
+      date: p.date||'?',
+      amount: p.amount!=null ? p.amount : '?',
+      amountUSD: (typeof paidUSD==='function'? paidUSD(p).toFixed(2):'?'),
+      currency: p.currency || p.channel || '?',
+      batchId: p.batchId || '(NONE — never linked)',
+      reason: !p.batchId ? 'no link set' : 'points to DELETED batch',
+      _wV: p._wV!=null?p._wV:'(none)',
+      _wDev: p._wDev || '(unknown)',
+      _wBy: p._wBy || '(unknown)',
+      _wAt: p._wAt || '?',
+      _orphanedFromBatch: p._orphanedFromBatch || '—'
+    });
+  });
+  console.log('%cBatches you can link these to:','color:#3b5bdb;font-weight:bold');
+  console.table((DB.batches||[]).map(b=>({batchId:b.batchId, id:b.id, status:b.status})));
+  console.log('To link one: linkOrphanPayment(\'PAYMENT_ID\', \'BATCH_INTERNAL_ID\')');
+  return orphans;
+};
+
+window.tracePayment = function(amountOrId) {
+  const q = String(amountOrId);
+  const pays = (DB.payments||[]).filter(p =>
+    p.id === q ||
+    String(p.amount||'').includes(q) ||
+    String(paidUSD(p).toFixed(2)) === q ||
+    Math.round(paidUSD(p)) === Math.round(parseFloat(q)||-1));
+  if (!pays.length) { console.log('No payment matches', q); return; }
+  const batchIds = new Set((DB.batches||[]).map(b=>b.id));
+  pays.forEach(p => {
+    const linked = !!p.batchId;
+    const batchExists = p.batchId && batchIds.has(p.batchId);
+    const b = (DB.batches||[]).find(x=>x.id===p.batchId);
+    console.log('%c═══ Payment ' + p.id + ' ═══','font-weight:bold;color:#3b5bdb');
+    console.table({
+      date: p.date, amountUSD: paidUSD(p).toFixed(2), channel: p.channel||'',
+      batchId: p.batchId || '(none)',
+      status: !linked ? 'NEVER LINKED' : batchExists ? 'LINKED ✓ (batch '+(b?.batchId||'?')+')' : 'BATCH DELETED ✗',
+      _wV: p._wV||0, _wDev: p._wDev||'?', _wBy: p._wBy||'?', _wAt: p._wAt||'?',
+      _orphanedFromBatch: p._orphanedFromBatch || '—'
+    });
+    if (linked && !batchExists) console.log('%c→ This payment points to a batch that was DELETED. Link it to a surviving batch.','color:#c0392b');
+    if (!linked) console.log('%c→ This payment has no batch. Link it in the Reports orphan card.','color:#b45309');
+  });
+  console.log('Available batches to link to:');
+  console.table((DB.batches||[]).map(b=>({batchId:b.batchId, id:b.id, status:b.status})));
+  return pays;
 };
 
 window.whyOrphaned = function() {
@@ -11359,7 +11735,7 @@ function saveBatch() {
         batchOrders.forEach(o => {
           const existing = DB.stock.find(s=>s.orderId===o.id&&s.warehouseId===defWH.id);
           if (!existing) {
-            DB.stock.push({ id:uid(), orderId:o.id, batchId:o.batchId,
+            DB.stock.push({ id:stockId(o.id, defWH.id), orderId:o.id, batchId:o.batchId,
               warehouseId:defWH.id, qty:(typeof effRcvQty==='function' ? effRcvQty(o) : Number(o.qty)||0),
               baleIds: o.baleIds||[], baleQtys: o.baleQtys||{}, createdAt:new Date().toISOString() });
           }
@@ -14964,7 +15340,15 @@ function _mergeSnapshot(label) {
       payments:JSON.parse(JSON.stringify(DB.payments||[])),
       receivedLog: JSON.parse(JSON.stringify(DB.receivedLog||[])) };
     try { localStorage.setItem('fazza_merge_undo', JSON.stringify(snap)); }
-    catch(e) { localStorage.setItem('fazza_merge_undo', JSON.stringify(snap, _stripBase64ForCache)); }
+    catch(e) {
+      // fallback: strip base64 if the helper is available in this scope; else
+      // just drop the cache write (the in-memory copy below still has the data).
+      try {
+        const _stripFn = (typeof _stripBase64ForCache === 'function') ? _stripBase64ForCache
+          : (k, v) => (typeof v === 'string' && v.startsWith('data:')) ? '' : v;
+        localStorage.setItem('fazza_merge_undo', JSON.stringify(snap, _stripFn));
+      } catch(e2) { /* cache write skipped — memory copy is authoritative */ }
+    }
     window._mergeUndoSnap = snap;   // memory copy keeps images even if cache stripped
   } catch(e) { console.warn('undo snapshot failed', e); }
 }
@@ -15513,8 +15897,6 @@ function _saveCountBatch() {
         team: (it.name||'Unnamed item').trim(),
         sku: (it.sku||'').trim().toUpperCase(),  // may be blank — auto-filled below
         qty: it.counted,
-        received: true,
-        receivedQty: it.counted,
         imgUrl: it.imgUrl || '',
         baleIds: it.baleId ? String(it.baleId).split(',').map(s=>s.trim()).filter(Boolean) : [],
         baleNo: it.baleId || '',
@@ -15526,7 +15908,7 @@ function _saveCountBatch() {
       if (!newOrder.sku && typeof nextOrderSKU === 'function') newOrder.sku = nextOrderSKU(newOrder);
       DB.orders.push(newOrder);
       it.orderId = newOrder.id;  // link so the received log records it
-      DB.stock.push({ id: uid(), orderId: newOrder.id, batchId: d.batchId,
+      DB.stock.push({ id: stockId(newOrder.id, (d.warehouseId||'')), orderId: newOrder.id, batchId: d.batchId,
         warehouseId: whId, qty: it.counted, receivedCount: it.counted,
         baleIds: newOrder.baleIds, countedAt: new Date().toISOString(),
         createdAt: new Date().toISOString() });
@@ -15551,23 +15933,14 @@ function _saveCountBatch() {
         row.countedAt = new Date().toISOString();
       } else {
         const order = DB.orders.find(o => o.id === ln.orderId);
-        row = { id: uid(), orderId: ln.orderId, batchId: d.batchId,
+        DB.stock.push({ id: stockId(ln.orderId, whId), orderId: ln.orderId, batchId: d.batchId,
           warehouseId: whId, qty: alloc, receivedCount: alloc,
           baleIds: (order && order.baleIds) || [], countedAt: new Date().toISOString(),
-          createdAt: new Date().toISOString() };
-        DB.stock.push(row);
+          createdAt: new Date().toISOString() });
       }
-      if (window._apiMod?.fsWrite) window._apiMod.fsWrite('stock', row).catch(()=>{});
       const order = DB.orders.find(o => o.id === ln.orderId);
       if (order) {
-        order.received = true;
-        order.receivedQty = alloc;
         order.receivedCounted = true;
-        const unit = parseFloat(order.unitPriceRMB) || 0;
-        if (unit > 0) {
-          order.totalRMB = unit * alloc;
-          order.totalUSD = order.totalRMB * (typeof cachedRate === 'number' && cachedRate ? cachedRate : 0);
-        }
         // Only write bale edits back when this row maps to a single order line
         // (for merged rows the combined bale string is ambiguous per line).
         if (lines.length === 1 && it.baleId != null) {
@@ -15575,10 +15948,6 @@ function _saveCountBatch() {
           order.baleIds = ids;
           order.baleNo = ids.join(', ');
         }
-        // Persist the updated order (received qty/totals) to the backend —
-        // without this, a page refresh re-fetches the stale server copy and
-        // the recount silently reverts.
-        if (window._apiMod?.fsWrite) window._apiMod.fsWrite('orders', order).catch(()=>{});
       }
     });
   });
@@ -15728,7 +16097,7 @@ function _renderReceivedCard(entry) {
       </div>`;
 }
 
-// Export a received entry as a PDF to send the supplier of the cargo
+// Export a received entry as a PDF to send the supplier
 function downloadReceivedPDF(id) {
   const entry = (DB.receivedLog||[]).find(e => e.id === id);
   if (!entry) return;
@@ -15967,24 +16336,13 @@ function _applyReceivedToStock(items) {
       row.receivedCount = it.qty;
       row.countedAt = new Date().toISOString();
     } else {
-      row = { id: uid(), orderId: order.id, batchId: order.batchId,
+      DB.stock.push({ id: stockId(order.id, whId), orderId: order.id, batchId: order.batchId,
         warehouseId: whId, qty: it.qty, receivedCount: it.qty,
         baleIds: order.baleIds||[], countedAt: new Date().toISOString(),
-        createdAt: new Date().toISOString() };
-      DB.stock.push(row);
+        createdAt: new Date().toISOString() });
     }
-    if (window._apiMod?.fsWrite) window._apiMod.fsWrite('stock', row).catch(()=>{});
-    // Mark the order + batch as actually counted and persist the received qty
-    order.received = true;
-    order.receivedQty = it.qty;
+    // Mark the order + batch as actually counted
     order.receivedCounted = true;
-    const unit = parseFloat(order.unitPriceRMB) || 0;
-    if (unit > 0) {
-      order.totalRMB = unit * it.qty;
-      order.totalUSD = order.totalRMB * (typeof cachedRate === 'number' && cachedRate ? cachedRate : 0);
-    }
-    // Persist the updated order to the backend, or the recount reverts on refresh.
-    if (window._apiMod?.fsWrite) window._apiMod.fsWrite('orders', order).catch(()=>{});
     if (batch) { batch.hasCountedItems = true; if (window._apiMod?.fsWrite) window._apiMod.fsWrite('batches', batch).catch(()=>{}); }
     applied++;
   });
@@ -16398,14 +16756,31 @@ function findDuplicateTransfers() {
   const sorted = (DB.transfers||[]).slice()
     .sort((a,b)=>String(a.createdAt||a.date||'').localeCompare(String(b.createdAt||b.date||'')));
 
-  // PASS 1 — exact repeats: same route + same item-set (ANY date). These are
-  // almost always a double-submit or sync echo. Keep the earliest.
+  // PASS 1 — REAL duplicates only: same route + same item-set AND created within
+  // a short window of each other (a double-submit or sync echo). Two transfers
+  // of the same route days apart are LEGITIMATE repeat transfers, not duplicates,
+  // so we do NOT flag them. This stops false alarms on normal recurring routes.
+  const DUP_WINDOW_MS = 10 * 60 * 1000;   // 10 minutes
   const seen = {};
   sorted.forEach(t => {
     const sig = (t.fromWarehouseId||'') + '>' + (t.toWarehouseId||'') + '|'
       + (t.items||[]).map(it => it.orderId+':'+it.qty).sort().join(',');
-    if (seen[sig]) dups.push({ dup: t, original: seen[sig], sig, reason: 'identical route + quantities' });
-    else seen[sig] = t;
+    const tTime = new Date(t.createdAt || t.date || 0).getTime();
+    if (seen[sig]) {
+      const prevTime = new Date(seen[sig].createdAt || seen[sig].date || 0).getTime();
+      const closeInTime = Math.abs(tTime - prevTime) <= DUP_WINDOW_MS;
+      // Same day + same exact createdAt second is also a strong duplicate signal
+      const sameSecond = (t.createdAt && seen[sig].createdAt &&
+                          t.createdAt.slice(0,19) === seen[sig].createdAt.slice(0,19));
+      if (closeInTime || sameSecond) {
+        dups.push({ dup: t, original: seen[sig], sig, reason: 'identical route + quantities within minutes (double-submit)' });
+      } else {
+        // legitimate repeat — advance the reference so we compare consecutive ones
+        seen[sig] = t;
+      }
+    } else {
+      seen[sig] = t;
+    }
   });
 
   // PASS 2 — over-received: transfers that in total move MORE of an order than
@@ -16495,7 +16870,7 @@ function clampOrderTotal(o, pushList) {
     const b = (DB.batches||[]).find(x=>x.id===o.batchId);
     const homeId = b?.warehouseId || ((DB.warehouses||[]).find(w=>w.isDefault)||{}).id || (DB.warehouses||[])[0]?.id;
     let row = rows[0] || (DB.stock||[]).find(s=>s.orderId===o.id && s.warehouseId===homeId);
-    if (!row && homeId) { row = {id:uid(),orderId:o.id,batchId:o.batchId,warehouseId:homeId,qty:0,baleIds:[],baleQtys:{},createdAt:nowIso}; DB.stock.push(row); }
+    if (!row && homeId) { row = {id:stockId(o.id,homeId),orderId:o.id,batchId:o.batchId,warehouseId:homeId,qty:0,baleIds:[],baleQtys:{},createdAt:nowIso}; DB.stock.push(row); }
     if (row && Number(row.qty||0)!==expected) { row.qty=expected; row._wAt=nowIso; row.doctorFixedAt=nowIso; changed=true; if(pushList&&!pushList.includes(row))pushList.push(row); }
     return changed;
   }
@@ -16553,7 +16928,7 @@ function rebuildOrderStock(o, pushList) {
     let row = (DB.stock||[]).find(s => s.orderId === o.id && s.warehouseId === wid);
     if (!row) {
       if (q === 0) return;
-      row = { id: uid(), orderId: o.id, batchId: o.batchId, warehouseId: wid, qty: 0, baleIds: [], baleQtys: {}, createdAt: nowIso };
+      row = { id: stockId(o.id, wid), orderId: o.id, batchId: o.batchId, warehouseId: wid, qty: 0, baleIds: [], baleQtys: {}, createdAt: nowIso };
       DB.stock.push(row);
     }
     if (Number(row.qty||0) !== q) {
@@ -17779,9 +18154,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Flush pending Firestore changes when the tab/app is closed, so data
     // logged right before closing isn't lost in the debounce window.
     window.addEventListener('pagehide', () => {
+      try { if (typeof _saveFlush === 'function') _saveFlush(); } catch(e) {}
       try { if (window._apiMod?.flushApiPush) window._apiMod.flushApiPush(); } catch(e) {}
     });
     window.addEventListener('beforeunload', () => {
+      try { if (typeof _saveFlush === 'function') _saveFlush(); } catch(e) {}
       try { if (window._apiMod?.flushApiPush) window._apiMod.flushApiPush(); } catch(e) {}
     });
 
@@ -17838,7 +18215,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       const wh = DB.warehouses.find(w=>w.id===b.warehouseId) || defWH;
       DB.orders.filter(o=>o.batchId===b.id).forEach(o=>{
         if (!DB.stock.find(s=>s.orderId===o.id)) {
-          DB.stock.push({id:uid(),orderId:o.id,batchId:b.id,
+          DB.stock.push({id:stockId(o.id, wh.id),orderId:o.id,batchId:b.id,
             warehouseId:wh.id,qty:Number(o.qty)||0,
             baleIds:o.baleIds||[],createdAt:new Date().toISOString()});
           added++;
@@ -18892,6 +19269,62 @@ function resetInactivityTimer() {
     logout();
   }, INACTIVITY_MS);
 }
+
+// ═══════════════════ AUTO-UPDATE CHECKER ═══════════════════
+let _lastUserActivity = Date.now();
+['click','keydown','touchstart','mousemove'].forEach(ev =>
+  window.addEventListener(ev, () => { _lastUserActivity = Date.now(); }, { passive:true }));
+
+function _runningVersion() {
+  return (document.querySelector('meta[name="version"]')||{}).content || '';
+}
+
+async function _checkForUpdate() {
+  try {
+    // Fetch the deployed index.html with a cache-buster so we get the LIVE copy,
+    // not the browser's cached one. Only read the small <meta version> line.
+    const resp = await fetch('/index.html?v=' + Date.now(), { cache: 'no-store' });
+    if (!resp.ok) return;
+    const text = await resp.text();
+    const m = text.match(/<meta name="version" content="([^"]+)"/);
+    if (!m) return;
+    const deployed = m[1];
+    const running  = _runningVersion();
+    if (deployed && running && deployed !== running) {
+      _showUpdateBanner(deployed, running);
+    }
+  } catch(e) { /* offline or blocked — ignore, try again next cycle */ }
+}
+
+function _showUpdateBanner(deployed, running) {
+  // If the user has been idle for 30s+, just refresh automatically (safe —
+  // their data is saved). Otherwise show a tap-to-update banner so we don't
+  // interrupt someone mid-typing.
+  const idleMs = Date.now() - _lastUserActivity;
+  const typing = document.querySelector('input:focus, textarea:focus, select:focus');
+  if (idleMs > 30000 && !typing) {
+    try { if (typeof _saveFlush === 'function') _saveFlush(); } catch(e){}
+    location.reload();
+    return;
+  }
+  if (document.getElementById('update-banner')) return;   // already showing
+  const bar = document.createElement('div');
+  bar.id = 'update-banner';
+  bar.style.cssText = 'position:fixed;left:50%;transform:translateX(-50%);bottom:20px;z-index:99999;background:#16653a;color:#fff;padding:12px 18px;border-radius:12px;box-shadow:0 6px 24px rgba(0,0,0,.25);display:flex;align-items:center;gap:14px;font-size:14px;font-weight:600;max-width:92vw';
+  bar.innerHTML = '<span>🔄 A new version is available.</span>' +
+    '<button id="update-now-btn" style="background:#fff;color:#16653a;border:none;border-radius:8px;padding:7px 16px;font-weight:800;cursor:pointer">Update now</button>' +
+    '<button id="update-later-btn" style="background:transparent;color:#fff;border:1px solid rgba(255,255,255,.4);border-radius:8px;padding:7px 12px;font-weight:600;cursor:pointer">Later</button>';
+  document.body.appendChild(bar);
+  document.getElementById('update-now-btn').onclick = () => {
+    try { if (typeof _saveFlush === 'function') _saveFlush(); } catch(e){}
+    location.reload();
+  };
+  document.getElementById('update-later-btn').onclick = () => { bar.remove(); };
+}
+
+// Check shortly after load, then every 90 seconds.
+setTimeout(_checkForUpdate, 8000);
+setInterval(_checkForUpdate, 90000);
 
 function startInactivityWatcher() {
   clearTimeout(_inactivityTimer);
@@ -20155,12 +20588,17 @@ function posConfirmAdd(orderId) {
   const net     = gross - discAmt;  // TZS
   const netUSD  = net / tzsR;
   const existing = posCart.findIndex(c=>c.orderId===orderId);
+  const _itemWh = posGetWarehouseId();
+  const _itemWhName = (DB.warehouses.find(w=>w.id===_itemWh)||{}).name || '';
   const item = { orderId, batchId:o.batchId, batchName:b?.batchId||'',
     team:o.team||'?', material:o.material||'', imgUrl:o.imgUrl||'',
     unitPrice:price, unitPriceUSD: Math.round(price/tzsR*100)/100,
     qty, discount, gross, discountAmt:discAmt, subtotal:net, subtotalUSD:netUSD,
-    baleRef: bale||'', currency:'TZS' };
-  if (existing>=0) posCart[existing]=item;
+    baleRef: bale||'', currency:'TZS',
+    warehouseId:_itemWh, warehouseName:_itemWhName };   // per-item warehouse (multi-WH invoice)
+  // match existing line by orderId AND warehouse (same SKU from 2 warehouses = 2 lines)
+  const existing2 = posCart.findIndex(cc => cc.orderId===orderId && cc.warehouseId===_itemWh);
+  if (existing2>=0) posCart[existing2]=item;
   else posCart.push(item);
   document.getElementById('pos-add-modal').style.display='none';
   posRenderProducts(); posRenderCart();
@@ -20368,8 +20806,16 @@ function posPayModeSelect(mode) {
 function posProcessSale(confirmed) {
   if (!posCart.length) { toast('Cart is empty','error'); return; }
   const whId = posGetWarehouseId();
-  if (!whId) { toast('⚠️ Select a warehouse before completing a sale','error'); return; }
+  // Multi-warehouse invoices: each cart item can carry its own warehouse. Only
+  // block if NEITHER a current warehouse is selected NOR the items specify one.
+  const _allItemsHaveWh = posCart.every(i => i.warehouseId);
+  if (!whId && !_allItemsHaveWh) { toast('⚠️ Select a warehouse before completing a sale','error'); return; }
   if (!confirmed) { posPreviewInvoice(); return; }
+  // Double-submit guard: block a second identical sale within 8s (double-tap /
+  // laggy button) so revenue and stock aren't counted twice.
+  if (window._saleInFlight) { toast('Sale is already processing…','error'); return; }
+  window._saleInFlight = true;
+  setTimeout(() => { window._saleInFlight = false; }, 8000);
   const customer  = posSelectedCustomer?.name || document.getElementById('pos-customer')?.value||'';
   const custPhone  = posSelectedCustomer?.phone || document.getElementById('pos-customer-phone')?.value||'';
   const totalTZS  = posCart.reduce((s,i)=>s+i.subtotal,0);
@@ -20417,7 +20863,8 @@ function posProcessSale(confirmed) {
     posSelectedCustomer = DB.customers.find(c=>c.name.toLowerCase()===customer.toLowerCase());
   }
   DB.sales.push(sale);
-  if (window._apiMod?.fsWrite) window._apiMod.fsWrite('sales', sale).catch(()=>{});
+  window._saleInFlight = false;   // sale recorded — release the guard
+  try { if (typeof scheduleStockSelfHeal==='function') scheduleStockSelfHeal(6000); } catch(e){}
   // 💰 Commission: 50 TZS × pieces, split 70/20/10 down the customer's acquirer chain
   try {
     const comm = computeSaleCommission(sale, true);
@@ -20439,9 +20886,10 @@ function posProcessSale(confirmed) {
     // clamp swallowed the overflow. Both leaks made stock permanently higher
     // than received−sold — the exact drift Stock Doctor kept re-flagging.
     let _remaining = Number(item.qty)||0;
+    const _itemWh = item.warehouseId || whId;   // per-item warehouse (multi-WH invoice)
     const _totBefore = DB.stock.filter(s=>s.orderId===item.orderId).reduce((x,s)=>x+Number(s.qty||0),0);
     const _rows = [];
-    const _own = DB.stock.find(s=>s.orderId===item.orderId && s.warehouseId===whId);
+    const _own = DB.stock.find(s=>s.orderId===item.orderId && s.warehouseId===_itemWh);
     if (_own) _rows.push(_own);
     DB.stock.filter(s=>s.orderId===item.orderId && s!==_own && Number(s.qty)>0)
       .sort((a,b)=>Number(b.qty)-Number(a.qty))
@@ -20452,11 +20900,6 @@ function posProcessSale(confirmed) {
       if (take > 0) {
         r.qty = Number(r.qty) - take;
         _remaining -= take;
-        // Push the deducted row immediately — without this, an unsynced local
-        // decrement can be silently overwritten by the next 8s server poll
-        // (e.g. tab backgrounded right after a sale), leaving stock "stuck"
-        // at the pre-sale quantity forever.
-        if (window._apiMod?.fsWrite) window._apiMod.fsWrite('stock', r).catch(()=>{});
         if (r !== _own) console.warn('[POS] stock taken from another warehouse for', item.team, '—', take, 'pcs from', (DB.warehouses.find(w=>w.id===r.warehouseId)?.name||r.warehouseId));
       }
     }
@@ -21091,6 +21534,9 @@ function _empSwitchTab_OLD_UNUSED(tab) {
 };
 window._confirmSaleDelete = function _confirmSaleDelete(saleId) {
   const s = DB.sales.find(x=>x.id===saleId); if(!s) return;
+  // Tombstone FIRST so this delete is recognized as intentional and doesn't get
+  // restored on refresh by the sync's delete-protection guard.
+  if (window._apiMod?.markDeleted) window._apiMod.markDeleted('sales', saleId);
   
   // Log to server audit trail BEFORE deleting (so we have the sale data)
   const user = _auditGetUser();
@@ -21114,16 +21560,24 @@ window._confirmSaleDelete = function _confirmSaleDelete(saleId) {
   // Also log locally
   _auditAppend([auditEntry]);
   
-  // Restore stock
-  const whId = s.warehouseId;
-  if (whId) {
-    s.items.forEach(item => {
-      const stockRow = DB.stock.find(x=>x.orderId===item.orderId&&x.warehouseId===whId);
-      if (stockRow) stockRow.qty += item.qty;
-    });
-  }
+  // Restore stock — to each item's OWN warehouse (supports multi-warehouse sales)
+  s.items.forEach(item => {
+    const wh = item.warehouseId || s.warehouseId;
+    if (!wh) return;
+    let stockRow = DB.stock.find(x=>x.orderId===item.orderId && x.warehouseId===wh);
+    if (!stockRow) {
+      // recreate the row deterministically if it was fully emptied/removed
+      stockRow = { id: (typeof stockId==='function'?stockId(item.orderId,wh):uid()),
+        orderId:item.orderId, warehouseId:wh, qty:0, baleIds:[], createdAt:new Date().toISOString() };
+      DB.stock.push(stockRow);
+    }
+    stockRow.qty += Number(item.qty)||0;
+  });
   DB.sales = DB.sales.filter(x=>x.id!==saleId);
   save();
+  // Push the deletion to the cloud immediately so it's gone everywhere.
+  if (window._apiMod?.fsDelete) { try { window._apiMod.fsDelete('sales', saleId); } catch(e){} }
+  if (window._apiMod?.flushPush) { try { window._apiMod.flushPush(); } catch(e){} }
   document.getElementById('sale-viewer-modal')?.remove();
   renderSalesLog();
   toast('Sale deleted and stock restored ✓');
@@ -22243,6 +22697,9 @@ function renderCashBank() {
 }
 
 async function submitCashCount() {
+  if (window._cashCountInFlight) { toast('Already saving…','error'); return; }
+  window._cashCountInFlight = true;
+  setTimeout(() => { window._cashCountInFlight = false; }, 8000);
   const counted = Number(document.getElementById('cb-count-amt')?.value)||0;
   const notes = document.getElementById('cb-count-notes')?.value?.trim()||'';
   const whId = window._cbWh;
@@ -22256,6 +22713,7 @@ async function submitCashCount() {
   // replace any existing log for today+warehouse
   DB.cashLogs = DB.cashLogs.filter(l => !(l.warehouseId===whId && l.date===_todayStr()));
   DB.cashLogs.push(log);
+  window._cashCountInFlight = false;
   save();
   if (window._apiMod?.fsWrite) window._apiMod.fsWrite('cashLogs', log).catch(()=>{});
   toast(__('cb-count-saved'));
@@ -22265,6 +22723,9 @@ async function submitCashCount() {
 async function submitBankDeposit() {
   const amount = Number(document.getElementById('cb-dep-amt')?.value)||0;
   if (!amount) { toast(__('cb-need-amount'),'error'); return; }
+  if (window._bankDepInFlight) { toast('Deposit is already saving…','error'); return; }
+  window._bankDepInFlight = true;
+  setTimeout(() => { window._bankDepInFlight = false; }, 12000);
   const whId = window._cbWh;
   const ref = document.getElementById('cb-dep-ref')?.value?.trim()||'';
   let slipUrl = '';
@@ -22280,6 +22741,7 @@ async function submitBankDeposit() {
   };
   DB.bankDeposits = DB.bankDeposits || [];
   DB.bankDeposits.push(dep);
+  window._bankDepInFlight = false;
   save();
   if (window._apiMod?.fsWrite) window._apiMod.fsWrite('bankDeposits', dep).catch(()=>{});
   window._cbDepFile = null;
@@ -22411,6 +22873,9 @@ async function submitBankWithdrawal() {
   if (!_isTreasuryOwner()) { toast(__('treasury-owner-only'),'error'); return; }
   const amount = Number(document.getElementById('tr-wd-amt')?.value)||0;
   if (!amount) { toast(__('cb-need-amount'),'error'); return; }
+  if (window._bankWdInFlight) { toast('Withdrawal is already saving…','error'); return; }
+  window._bankWdInFlight = true;
+  setTimeout(() => { window._bankWdInFlight = false; }, 12000);
   const reason = document.getElementById('tr-wd-reason')?.value?.trim()||'';
   if (!reason) { toast(__('treasury-need-reason'),'error'); return; }
   const bal = _bankBalance();
@@ -22422,6 +22887,7 @@ async function submitBankWithdrawal() {
   const wd = { id:uid(), amount, reason, slipUrl, date:_todayStr(), by:getUsers().find(u=>u.id===currentUserId)?.name||'', createdAt:new Date().toISOString() };
   DB.bankWithdrawals = DB.bankWithdrawals || [];
   DB.bankWithdrawals.push(wd);
+  window._bankWdInFlight = false;
   save();
   if (window._apiMod?.fsWrite) window._apiMod.fsWrite('bankWithdrawals', wd).catch(()=>{});
   window._trWdFile = null;
@@ -22536,7 +23002,14 @@ function _renderCreditsInner(root) {
   });
   if (_creditSearch) {
     const q=_creditSearch.toLowerCase();
-    shown=shown.filter(c=>(c.customerName||'').toLowerCase().includes(q)||(c.customerPhone||'').includes(q)||(c.invoiceNo||'').toLowerCase().includes(q));
+    shown=shown.filter(c=>{
+      const cust = (DB.customers||[]).find(x=>x.id===c.customerId);
+      const agent = (cust?.agent||'').toLowerCase();
+      return (c.customerName||'').toLowerCase().includes(q)
+        || (c.customerPhone||'').includes(q)
+        || (c.invoiceNo||'').toLowerCase().includes(q)
+        || agent.includes(q);
+    });
   }
   shown=shown.sort((a,b)=>b.balance-a.balance);
 
@@ -23320,10 +23793,31 @@ function _stockBaleEntries(s) {
   const o = DB.orders.find(x => x.id === s.orderId);
   let map = (s.baleQtys && Object.keys(s.baleQtys).length) ? {...s.baleQtys} : null;
   if (!map) {
-    // Nothing recorded on the row yet — inherit the import map only if this is
-    // the order's sole stock row (nothing has moved yet).
     const rows = DB.stock.filter(x => x.orderId === s.orderId);
-    if (rows.length === 1 && o?.baleQtys && Object.keys(o.baleQtys).length) map = {...o.baleQtys};
+    const soleRow = (rows.length === 1);
+    // 1) inherit the order's baleQtys map if it has one
+    if (soleRow && o?.baleQtys && Object.keys(o.baleQtys).length) {
+      map = {...o.baleQtys};
+    } else if (soleRow) {
+      // 2) build a map from the order's bale NUMBER list (baleIds/baleNo) that
+      //    imports create without quantities. Each bale = 500 pcs by default;
+      //    any remainder goes on the last bale so the total matches the row qty.
+      const baleList = (o?.baleIds && o.baleIds.length) ? o.baleIds.slice()
+        : (o?.baleNo ? String(o.baleNo).split(',').map(x=>x.trim()).filter(Boolean) : []);
+      if (baleList.length) {
+        map = {};
+        const rowQty = Number(s.qty)||0;
+        const per = 500;
+        let assigned = 0;
+        baleList.forEach((b, i) => {
+          let q = per;
+          if (i === baleList.length - 1) q = Math.max(0, rowQty - assigned);  // last bale absorbs remainder
+          else q = Math.min(per, Math.max(0, rowQty - assigned));
+          map[String(b)] = q;
+          assigned += q;
+        });
+      }
+    }
   }
   if (!map) return s.qty > 0 ? [{ bale: '', qty: Number(s.qty)||0 }] : [];
   let entries = Object.entries(map)
@@ -23818,11 +24312,51 @@ async function saveTransfer() {
 
   const fromWh = DB.warehouses.find(w=>w.id===fromId);
   const toWh   = DB.warehouses.find(w=>w.id===toId);
-  const transfer = { id:uid(), fromWarehouseId:fromId, toWarehouseId:toId,
+  // DUPLICATE GUARD: warn if an identical route + item-set already exists (any
+  // date). This is what was silently duplicating and inflating destination
+  // stock. We WARN rather than block, so genuine repeat transfers are allowed.
+  const _newSig = String(fromId)+'>'+String(toId)+'|'+
+    (items||[]).map(it => (it.orderId||it.sku||'')+':'+Number(it.qty||0)).sort().join(',');
+  const _dupExisting = (DB.transfers||[]).find(t =>
+    (String(t.fromWarehouseId)+'>'+String(t.toWarehouseId)+'|'+
+     (t.items||[]).map(it => (it.orderId||it.sku||'')+':'+Number(it.qty||0)).sort().join(',')) === _newSig);
+  if (_dupExisting) {
+    const when = _dupExisting.date || (_dupExisting.createdAt||'').slice(0,10);
+    const ok = confirm('⚠️ You already recorded an identical transfer (' +
+      (fromWh?.name||'?') + ' → ' + (toWh?.name||'?') + ', same items) on ' + when + '.\n\n' +
+      'Recording it again will move the stock a SECOND time and inflate ' + (toWh?.name||'the destination') + '.\n\n' +
+      'Is this a genuinely NEW, separate transfer?');
+    if (!ok) {
+      window._trBaleResolved = [];
+      window._transferInFlight = false;
+      closeModal('transfer-modal');
+      return;
+    }
+  }
+  // Deterministic id: route + item-set + 10-minute time bucket. Identical
+  // transfers within the same bucket collapse to one row (kills duplicates from
+  // double-taps AND multi-device races). Genuine repeats later → new bucket → new id.
+  const _trSig = String(fromId)+'>'+String(toId)+'|'+
+    (items||[]).map(it=>(it.orderId||it.sku||'')+':'+Number(it.qty||0)).sort().join(',');
+  let _h = 0; for (let i=0;i<_trSig.length;i++){ _h=((_h<<5)-_h+_trSig.charCodeAt(i))|0; }
+  const _bucket = Math.floor(Date.now() / (10*60*1000));   // 10-min bucket
+  const _trId = 'trf_' + Math.abs(_h).toString(36) + '_' + _bucket;
+  const _dupSameBucket = (DB.transfers||[]).find(t => t.id === _trId);
+  const transfer = { id:_trId, fromWarehouseId:fromId, toWarehouseId:toId,
     fromName:fromWh?.name||'', toName:toWh?.name||'',
     items, date, notes, createdAt:new Date().toISOString(),
     createdBy:getUsers().find(u=>u.id===currentUserId)?.name||'' };
+  if (_dupSameBucket) {
+    console.warn('[Transfer] identical transfer already recorded moments ago ('+_trId+') — not duplicating stock move');
+    window._trBaleResolved = [];
+    window._transferInFlight = false;
+    toast('That transfer was just recorded — not duplicating', 'error');
+    closeModal('transfer-modal');
+    if (typeof renderTransfers==='function') renderTransfers();
+    return;
+  }
   DB.transfers.push(transfer);
+  try { if (typeof scheduleStockSelfHeal==='function') scheduleStockSelfHeal(6000); } catch(e){}
 
   window._trBaleResolved = [];
   window._transferInFlight = false;
@@ -24145,7 +24679,7 @@ function saveTransferEdit(transferId, itemCount) {
   t.items.forEach(item => {
     const src = DB.stock.find(s => s.orderId===item.orderId && s.warehouseId===t.fromWarehouseId);
     if (src) src.qty += item.qty;
-    else DB.stock.push({id:uid(), orderId:item.orderId, batchId:item.batchId, warehouseId:t.fromWarehouseId, qty:item.qty, baleIds:[], createdAt:new Date().toISOString()});
+    else DB.stock.push({id:stockId(item.orderId, t.fromWarehouseId), orderId:item.orderId, batchId:item.batchId, warehouseId:t.fromWarehouseId, qty:item.qty, baleIds:[], createdAt:new Date().toISOString()});
     const dst = DB.stock.find(s => s.orderId===item.orderId && s.warehouseId===t.toWarehouseId);
     if (dst) dst.qty = Math.max(0, dst.qty - item.qty);
   });
@@ -24158,11 +24692,11 @@ function saveTransferEdit(transferId, itemCount) {
     // Move from new source
     const src = DB.stock.find(s => s.orderId===ni.orderId && s.warehouseId===newFromId);
     if (src) src.qty = Math.max(0, src.qty - ni.newQty);
-    else DB.stock.push({id:uid(), orderId:ni.orderId, batchId:origItem?.batchId||'', warehouseId:newFromId, qty:-ni.newQty, baleIds:[], createdAt:new Date().toISOString()});
+    else DB.stock.push({id:stockId(ni.orderId, newFromId), orderId:ni.orderId, batchId:origItem?.batchId||'', warehouseId:newFromId, qty:-ni.newQty, baleIds:[], createdAt:new Date().toISOString()});
     // Add to destination
     const dst = DB.stock.find(s => s.orderId===ni.orderId && s.warehouseId===newToId);
     if (dst) dst.qty += ni.newQty;
-    else DB.stock.push({id:uid(), orderId:ni.orderId, batchId:origItem?.batchId||'', warehouseId:newToId, qty:ni.newQty, baleIds:[], createdAt:new Date().toISOString()});
+    else DB.stock.push({id:stockId(ni.orderId, newToId), orderId:ni.orderId, batchId:origItem?.batchId||'', warehouseId:newToId, qty:ni.newQty, baleIds:[], createdAt:new Date().toISOString()});
     updatedItems.push({...origItem, qty:ni.newQty});
   }
 
@@ -24190,13 +24724,17 @@ function deleteTransfer(transferId) {
   if (!confirm('Delete this transfer? Stock will be reversed.')) return;
   const t = DB.transfers.find(x => x.id === transferId);
   if (!t) return;
+  // Tombstone FIRST so the sync knows this is an INTENTIONAL delete and won't
+  // pull the transfer back on refresh (the delete-protection guard treats
+  // untombstoned disappearances as sync races and restores them).
+  if (window._apiMod?.markDeleted) window._apiMod.markDeleted('transfers', transferId);
 
   // Reverse stock changes
   t.items.forEach(item => {
     // Add qty back to source warehouse
     const src = DB.stock.find(s => s.orderId===item.orderId && s.warehouseId===t.fromWarehouseId);
     if (src) src.qty += item.qty;
-    else DB.stock.push({id:uid(), orderId:item.orderId, batchId:item.batchId,
+    else DB.stock.push({id:stockId(item.orderId, t.fromWarehouseId), orderId:item.orderId, batchId:item.batchId,
       warehouseId:t.fromWarehouseId, qty:item.qty, baleIds:[], createdAt:new Date().toISOString()});
 
     // Remove qty from destination warehouse
@@ -24207,6 +24745,9 @@ function deleteTransfer(transferId) {
   // Remove the transfer record
   DB.transfers = DB.transfers.filter(x => x.id !== transferId);
   save();
+  // Push the deletion to the cloud now so it's gone everywhere.
+  if (window._apiMod?.fsDelete) { try { window._apiMod.fsDelete('transfers', transferId); } catch(e){} }
+  if (window._apiMod?.flushPush) { try { window._apiMod.flushPush(); } catch(e){} }
 
   // Close modal and refresh
   document.getElementById('transfer-detail-modal')?.remove();
@@ -24956,6 +25497,9 @@ function expOpenModal(expId) {
 }
 
 function expSave(expId) {
+  if (window._expInFlight) { toast('Already saving…','error'); return; }
+  window._expInFlight = true;
+  setTimeout(() => { window._expInFlight = false; }, 6000);
   const date = document.getElementById('exp-date').value;
   const category = document.getElementById('exp-category').value;
   const amount = parseFloat(document.getElementById('exp-amount').value)||0;
@@ -24963,7 +25507,7 @@ function expSave(expId) {
   const source = document.getElementById('exp-source').value;
   const account = document.getElementById('exp-account').value.trim();
   const paidTo = document.getElementById('exp-paidto').value.trim();
-  if (amount <= 0) { toast('Enter an amount','error'); return; }
+  if (amount <= 0) { toast('Enter an amount','error'); window._expInFlight = false; return; }
   DB.expenses = DB.expenses || [];
   let e = expId ? DB.expenses.find(x=>x.id===expId) : null;
   if (e) {
@@ -24973,6 +25517,7 @@ function expSave(expId) {
     e = { id: uid(), date, category, amount, description, source, account, paidTo, createdAt:new Date().toISOString(), _wAt:new Date().toISOString(), _wV:1 };
     DB.expenses.push(e);
   }
+  window._expInFlight = false;
   save();
   if (window.__firebase?.fsSetDoc) window.__firebase.fsSetDoc('expenses', e.id, e).catch(()=>{});
   document.getElementById('exp-modal')?.remove();
@@ -25437,6 +25982,12 @@ function openCustomerModal(custId) {
           <div class="form-group"><label class="form-label">Location</label>
             <input type="text" class="form-input" id="cm-location" value="${cust?.location||''}" placeholder="e.g. Dar es Salaam"></div>
         </div>
+        <div class="form-group"><label class="form-label">🏷️ Agent / Group (label)</label>
+          <input class="form-input" id="cm-agent" list="cm-agent-list" placeholder="e.g. Agent John, Kariakoo, VIP" value="${cust?_h(cust.agent||''):''}">
+          <datalist id="cm-agent-list">
+            ${[...new Set((DB.customers||[]).map(x=>x.agent).filter(Boolean))].map(a=>`<option value="${_h(a)}">`).join('')}
+          </datalist>
+          <div style="font-size:11px;color:var(--ink3);margin-top:3px">Group customers under an agent or label to filter them together.</div></div>
         <div class="form-group"><label class="form-label">🏆 Acquired by (sales rep)</label>
           <select class="form-input" id="cm-acquired">
             <option value="">— none —</option>
@@ -25471,13 +26022,14 @@ function saveCustomerModal(custId) {
   if (!name) { if(errEl){errEl.textContent='Name is required';errEl.style.display='block';} return; }
   const acquiredById = document.getElementById('cm-acquired')?.value || '';
   const acq = acquiredById ? (DB.salesTeam||[]).find(m=>m.id===acquiredById) : null;
+  const agent = document.getElementById('cm-agent')?.value.trim() || '';
   if (custId) {
     const cust = DB.customers.find(c=>c.id===custId);
     if (cust) { cust.name=name; cust.phone=phone; cust.location=location; cust.avatar=avatar; cust.notes=notes;
-      cust.acquiredById=acquiredById; cust.acquiredByName=acq?acq.name:''; cust._wAt=new Date().toISOString(); }
+      cust.acquiredById=acquiredById; cust.acquiredByName=acq?acq.name:''; cust.agent=agent; cust._wAt=new Date().toISOString(); cust._wV=(Number(cust._wV)||0)+1; }
   } else {
     DB.customers.push({id:uid(),name,phone,location,avatar,notes,
-      acquiredById, acquiredByName:acq?acq.name:'', createdAt:new Date().toISOString()});
+      acquiredById, acquiredByName:acq?acq.name:'', agent, createdAt:new Date().toISOString(), _wV:1});
   }
   save();
   document.getElementById('customer-edit-modal')?.remove();
@@ -25492,8 +26044,10 @@ function saveCustomerNotes(custId, notes) {
 
 function deleteCustomer(custId) {
   if (!confirm('Delete this customer? Their sales history will remain.')) return;
+  if (window._apiMod?.markDeleted) window._apiMod.markDeleted('customers', custId);
   DB.customers = DB.customers.filter(c=>c.id!==custId);
   save();
+  if (window._apiMod?.fsDelete) { try { window._apiMod.fsDelete('customers', custId); } catch(e){} }
   document.getElementById('customer-edit-modal')?.remove();
   document.getElementById('customer-profile-modal')?.remove();
   renderCustomers();

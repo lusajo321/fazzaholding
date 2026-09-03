@@ -24,6 +24,7 @@ app = FastAPI(
     version="2.0.0",
     description="FAZZA Wholesale Jersey Portal — FastAPI + PostgreSQL",
     lifespan=lifespan,
+    servers=[{"url": "/api", "description": "Default"}],
 )
 
 origins = [o.strip() for o in settings.CORS_ORIGINS.split(",") if o.strip()]
