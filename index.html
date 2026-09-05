@@ -3959,30 +3959,46 @@ function _h(s) { return escapeHtml(s); }
 // ───────────────────────────────────────────────────────────────
 
 // ─────────────────── STATE ───────────────────
+// Safe localStorage JSON read: some keys (payments, sales, credits,
+// creditPayments) are AES-GCM encrypted at rest (see ENCRYPT_KEYS below) and
+// can only be decrypted AFTER login derives a key from the JWT. On a fresh
+// page load — before that key exists — a still-encrypted "ENC:..." value is
+// not valid JSON; JSON.parse would throw here and, since this runs at the top
+// level before anything else, take down the entire script (no login screen,
+// nothing). Fall back to the default instead of crashing; syncDownAll()/login
+// repopulates these from the server (and initCrypto() decrypts storage) once
+// the user signs in.
+function _safeParseLS(key, fallback) {
+  const raw = localStorage.getItem(key);
+  if (!raw) return JSON.parse(fallback);
+  try { return JSON.parse(raw); }
+  catch (e) { console.warn('[Boot] Could not parse localStorage', key, '— using default:', e.message); return JSON.parse(fallback); }
+}
+
 let DB; window.DB = DB = {
-  payments:   JSON.parse(localStorage.getItem('fazza_payments')   || '[]'),
-  batches:    JSON.parse(localStorage.getItem('fazza_batches')    || '[]'),
-  bales:      JSON.parse(localStorage.getItem('fazza_bales')      || '[]'),
-  orders:     JSON.parse(localStorage.getItem('fazza_orders')     || '[]'),
-  sales:      JSON.parse(localStorage.getItem('fazza_sales')      || '[]'),
-  customers:  JSON.parse(localStorage.getItem('fazza_customers')  || '[]'),
-  salesTeam:  JSON.parse(localStorage.getItem('fazza_salesTeam')  || '[]'),
-  commissions:JSON.parse(localStorage.getItem('fazza_commissions')|| '[]'),
-  commissionPayouts: JSON.parse(localStorage.getItem('fazza_commissionPayouts') || '[]'),
-  expenses:   JSON.parse(localStorage.getItem('fazza_expenses')   || '[]'),
-  warehouses: JSON.parse(localStorage.getItem('fazza_warehouses') || '[]'),
-  stock:      JSON.parse(localStorage.getItem('fazza_stock')      || '[]'),
-  transfers:  JSON.parse(localStorage.getItem('fazza_transfers')  || '[]'),
-  credits:        JSON.parse(localStorage.getItem('fazza_credits')        || '[]'),
-  creditPayments: JSON.parse(localStorage.getItem('fazza_creditPayments') || '[]'),
-  cargo:          JSON.parse(localStorage.getItem('fazza_cargo') || '[]'),
-  cargoPayments:  JSON.parse(localStorage.getItem('fazza_cargoPayments') || '[]'),
-  cashLogs:       JSON.parse(localStorage.getItem('fazza_cashLogs') || '[]'),
-  bankDeposits:   JSON.parse(localStorage.getItem('fazza_bankDeposits') || '[]'),
-  bankWithdrawals: JSON.parse(localStorage.getItem('fazza_bankWithdrawals') || '[]'),
-  jerseyLibrary:  JSON.parse(localStorage.getItem('fazza_jerseyLibrary') || '[]'),
-  receivedLog:    JSON.parse(localStorage.getItem('fazza_receivedLog') || '[]'),
-  settings:       JSON.parse(localStorage.getItem('fazza_settings') || '{"id":"app_settings"}'),
+  payments:   _safeParseLS('fazza_payments', '[]'),
+  batches:    _safeParseLS('fazza_batches', '[]'),
+  bales:      _safeParseLS('fazza_bales', '[]'),
+  orders:     _safeParseLS('fazza_orders', '[]'),
+  sales:      _safeParseLS('fazza_sales', '[]'),
+  customers:  _safeParseLS('fazza_customers', '[]'),
+  salesTeam:  _safeParseLS('fazza_salesTeam', '[]'),
+  commissions:_safeParseLS('fazza_commissions', '[]'),
+  commissionPayouts: _safeParseLS('fazza_commissionPayouts', '[]'),
+  expenses:   _safeParseLS('fazza_expenses', '[]'),
+  warehouses: _safeParseLS('fazza_warehouses', '[]'),
+  stock:      _safeParseLS('fazza_stock', '[]'),
+  transfers:  _safeParseLS('fazza_transfers', '[]'),
+  credits:        _safeParseLS('fazza_credits', '[]'),
+  creditPayments: _safeParseLS('fazza_creditPayments', '[]'),
+  cargo:          _safeParseLS('fazza_cargo', '[]'),
+  cargoPayments:  _safeParseLS('fazza_cargoPayments', '[]'),
+  cashLogs:       _safeParseLS('fazza_cashLogs', '[]'),
+  bankDeposits:   _safeParseLS('fazza_bankDeposits', '[]'),
+  bankWithdrawals: _safeParseLS('fazza_bankWithdrawals', '[]'),
+  jerseyLibrary:  _safeParseLS('fazza_jerseyLibrary', '[]'),
+  receivedLog:    _safeParseLS('fazza_receivedLog', '[]'),
+  settings:       _safeParseLS('fazza_settings', '{"id":"app_settings"}'),
 };
 // Seed default warehouse if none exist
 if (!DB.warehouses.length) {
